@@ -14,6 +14,7 @@ import numpy as np
 import onnxruntime as ort
 from PIL import Image, ImageDraw, ImageFont
 import os
+import time
 
 
 def letterbox(img, new_shape=(640, 640), color=(114, 114, 114)):
@@ -84,6 +85,12 @@ def run_detection(session, img, conf_thres=0.25, iou_thres=0.45, input_size=640)
     input_name = session.get_inputs()[0].name
     outputs = session.run(None, {input_name: img_trans})
 
+
+    a = np.asarray(outputs[0])  # shape (1,25200,15)
+    print('per-row len:', a.shape[-1])
+    print('example cls_probs:', a.reshape(-1, a.shape[-1])[0,:])
+
+
     # Support outputs shaped (1, N, C) or (N, C) or multiple outputs
     arr = None
     for out in outputs:
@@ -104,7 +111,7 @@ def run_detection(session, img, conf_thres=0.25, iou_thres=0.45, input_size=640)
     scores = []
     dets_info = []
 
-    # Follow C++ layout: [x,y,w,h,obj_conf, lmk0x..lmk7y (8 values), cls_scores...]
+    # Follow C++ layout: [x,y,w,h,obj_conf, lmk0x..lmk7y (8 values), cls_scores...] 5+8+2=15 total per row
     for row in arr:
         if row.size < 6:
             continue
@@ -175,10 +182,14 @@ def draw_results(img, results, out_path):
         cls = item.get('cls')
         plate = item.get('plate', '')
         color = item.get('color', '')
+        rec_time = item.get('rec_time', None)
         x1, y1, x2, y2 = map(int, box)
         # draw rectangle with PIL
         draw.rectangle([(x1, y1), (x2, y2)], outline=(0, 255, 0), width=2)
-        label = f"{plate} {color} {score:.2f}"
+        if rec_time is not None:
+            label = f"{plate} {color} {score:.2f} {rec_time:.3f}s"
+        else:
+            label = f"{plate} {color} {score:.2f}"
         try:
             # Pillow >=8.0: textbbox is available
             bbox = draw.textbbox((0, 0), label, font=font)
@@ -220,6 +231,32 @@ def get_transformed_roi(src_img, keypoints):
     M = cv2.getPerspectiveTransform(pts, pts_std)
     dst = cv2.warpPerspective(src_img, M, (maxWidth, maxHeight))
     return dst
+
+
+def get_split_merge(img):
+    # Split double-layer plate and merge (upper | lower) like C++ get_split_merge
+    if img is None or img.size == 0:
+        return img
+    h, w = img.shape[:2]
+    upper_h = int(5.0 / 12 * h)
+    lower_y = int(1.0 / 3 * h)
+    if upper_h <= 0 or lower_y >= h:
+        return img
+    upper = img[0:upper_h, 0:w]
+    lower = img[lower_y:h, 0:w]
+    if upper.size == 0 or lower.size == 0:
+        return img
+    # resize upper to lower size
+    try:
+        upper_resized = cv2.resize(upper, (lower.shape[1], lower.shape[0]), interpolation=cv2.INTER_LINEAR)
+    except Exception:
+        return img
+    out_h = lower.shape[0]
+    out_w = lower.shape[1] + upper_resized.shape[1]
+    out = np.full((out_h, out_w, 3), 114, dtype=np.uint8)
+    out[0:upper_resized.shape[0], 0:upper_resized.shape[1]] = upper_resized
+    out[0:lower.shape[0], upper_resized.shape[1]:] = lower
+    return out
 
 
 def run_plate_recognition(session, roi_img):
@@ -295,7 +332,11 @@ def run_plate_recognition(session, roi_img):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--image", required=False, help="Input image path", default="/home/faith/PlateRecognition/PlateDetectionRecognition/test/data/37_0302.jpg")
+    # parser.add_argument("--image", required=False, help="Input image path", default="/home/faith/PlateRecognition/PlateDetectionRecognition/test/data/double3.jpg")
+    parser.add_argument("--image", required=False, help="Input image path", default="/home/faith/PlateRecognition/PlateDetectionRecognition/test/data/double4.png")
+
+    # parser.add_argument("--image", required=False, help="Input image path", default="/home/faith/fux.png")
+
     parser.add_argument("--det-model", default="/home/faith/PlateRecognition/PlateDetectionRecognition/test/yolov5plate.onnx", help="Detection ONNX model path")
     parser.add_argument("--rec-model", default="/home/faith/PlateRecognition/PlateRecognition/test/plate_recognition_color.onnx", help="Plate recognition ONNX model path")
     parser.add_argument("--output", default="out.jpg", help="Output image path")
@@ -324,8 +365,13 @@ def main():
     else:
         print("Recognition model not found, continuing without recognition:", args.rec_model)
 
+    det_start = time.time()
     dets = run_detection(sess, img, conf_thres=args.conf, iou_thres=args.iou, input_size=args.size)
+    det_time = time.time() - det_start
+    print(f"Detection inference time: {det_time:.3f}s for {len(dets)} detections")
     annotated = []
+    rec_total = 0.0
+    rec_count = 0
     for b, conf, cls, kps in dets:
         plate_str = ""
         plate_color = ""
@@ -334,17 +380,34 @@ def main():
             roi = get_transformed_roi(img, kps)
         except Exception:
             roi = None
+        ####################################################################################
+        # If model predicts double-layer plate (label==1), split+merge to normalize layout before recognition
+        if cls == 1 and roi is not None and roi.size > 0:
+            try:
+                roi = get_split_merge(roi)
+            except Exception:
+                pass
+        ############################################################################
         if (roi is None or roi.size == 0) and b is not None:
             x1, y1, x2, y2 = map(int, b)
             roi = img[y1:y2, x1:x2]
+        rec_time = None
         if rec_sess is not None and roi is not None and roi.size > 0:
+            rec_start = time.time()
             plate_str, plate_color = run_plate_recognition(rec_sess, roi)
-        annotated.append({'bbox': b, 'score': conf, 'cls': cls, 'plate': plate_str, 'color': plate_color})
+            rec_time = time.time() - rec_start
+            rec_total += rec_time
+            rec_count += 1
+        annotated.append({'bbox': b, 'score': conf, 'cls': cls, 'plate': plate_str, 'color': plate_color, 'rec_time': rec_time})
 
     # attach font path to draw_results function for use inside
     draw_results.font_path = args.font
     draw_results(img, annotated, args.output)
     print(f"Wrote output to {args.output}")
+    if rec_count > 0:
+        print(f"Total recognition time: {rec_total:.3f}s for {rec_count} plates, average {rec_total/rec_count:.3f}s")
+    else:
+        print("No recognition runs performed.")
 
 
 if __name__ == '__main__':
