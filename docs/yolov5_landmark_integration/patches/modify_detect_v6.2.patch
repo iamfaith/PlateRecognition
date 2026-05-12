@@ -1,0 +1,107 @@
+*** Begin Patch
+*** Update File: models/yolo.py
+@@
+-class Detect(nn.Module):
+-    stride = None  # strides computed during build
+-    onnx_dynamic = False  # ONNX export parameter
+-
+-    def __init__(self, nc=80, anchors=(), ch=(), num_landmarks=4, inplace=True):  # detection layer
+-        """
+-        nc: number of classes
+-        num_landmarks: number of landmark points (each point has x+y => 2 dims). For 4 points => num_landmarks=4 => 8 dims
+-        """
+-        super().__init__()
+-        self.nc = nc
+-        self.num_landmarks = num_landmarks
+-        # outputs per anchor: 5 (xywh + obj) + 2*num_landmarks + nc
+-        self.no = 5 + 2 * self.num_landmarks + self.nc
+-        self.nl = len(anchors)  # number of detection layers
+-        self.na = len(anchors[0]) // 2  # number of anchors
+-        self.grid = [torch.zeros(1)] * self.nl
+-        self.anchor_grid = [torch.zeros(1)] * self.nl
+-        self.register_buffer('anchors', torch.tensor(anchors).float().view(self.nl, -1, 2))
+-        # initialize conv outputs using self.no
+-        self.m = nn.ModuleList(nn.Conv2d(x, self.no * self.na, 1) for x in ch)
+-        self.inplace = inplace
++class Detect(nn.Module):
++    stride = None  # strides computed during build
++    onnx_dynamic = False  # ONNX export parameter
++
++    def __init__(self, nc=80, anchors=(), ch=(), num_landmarks=0, inplace=True):  # detection layer
++        """
++        nc: number of classes
++        num_landmarks: number of landmark points (each point has x+y => 2 dims). For 4 points => num_landmarks=4 => 8 dims
++        Default num_landmarks=0 means no landmark prediction (backward compatible).
++        """
++        super().__init__()
++        self.nc = nc
++        self.num_landmarks = max(0, int(num_landmarks))
++        # outputs per anchor: 5 (xywh + obj) + 2*num_landmarks + nc
++        self.no = 5 + (2 * self.num_landmarks if self.num_landmarks > 0 else 0) + self.nc
++        self.nl = len(anchors)  # number of detection layers
++        self.na = len(anchors[0]) // 2  # number of anchors
++        self.grid = [torch.zeros(1)] * self.nl
++        self.anchor_grid = [torch.zeros(1)] * self.nl
++        self.register_buffer('anchors', torch.tensor(anchors).float().view(self.nl, -1, 2))
++        # initialize conv outputs using self.no
++        self.m = nn.ModuleList(nn.Conv2d(x, self.no * self.na, 1) for x in ch)
++        self.inplace = inplace
+@@
+-        x = x.view(bs, self.na, self.no, ny, nx)
+-        # split outputs
+-        xy = torch.sigmoid(x[..., 0:2, :, :])
+-        wh = x[..., 2:4, :, :]
+-        obj = torch.sigmoid(x[..., 4:5, :, :])
+-        lmk = x[..., 5:5 + 2 * self.num_landmarks, :, :]
+-        cls = x[..., 5 + 2 * self.num_landmarks:, :, :]
+-        # If landmarks are normalized in [0,1], apply sigmoid to lmk here so decoding is consistent.
+-        lmk = torch.sigmoid(lmk)
++        x = x.view(bs, self.na, self.no, ny, nx)
++        # split outputs
++        xy = torch.sigmoid(x[..., 0:2, :, :])
++        wh = x[..., 2:4, :, :]
++        obj = torch.sigmoid(x[..., 4:5, :, :])
++        if self.num_landmarks > 0:
++            lmk = x[..., 5:5 + 2 * self.num_landmarks, :, :]
++            cls = x[..., 5 + 2 * self.num_landmarks:, :, :]
++            # If landmarks are normalized in [0,1], apply sigmoid to lmk here so decoding is consistent.
++            lmk = torch.sigmoid(lmk)
++        else:
++            lmk = None
++            cls = x[..., 5:, :, :]
+@@
+-            if self.onnx_dynamic or self.grid[i].shape[2:4] != x[i].shape[2:4]:
+-                self.grid[i], self.anchor_grid[i] = self._make_grid(nx, ny, i)
+-
+-            # Apply sigmoid to all parts that should be in (0,1) and decode to absolute coordinates
+-            y = x[i]
+-            # Note: apply sigmoid selectively; xy,obj,cls and lmk use sigmoid for normalized outputs
+-            y[..., 0:2] = (torch.sigmoid(y[..., 0:2]) * 2 - 0.5 + self.grid[i]) * self.stride[i]  # xy
+-            y[..., 2:4] = (torch.sigmoid(y[..., 2:4]) * 2) ** 2 * self.anchor_grid[i]  # wh
+-            y[..., 4:5] = torch.sigmoid(y[..., 4:5])  # objectness
+-            # decode landmarks: use same scheme as xy (grid relative) then map to input scale via stride
+-            y[..., 5:5 + 2 * self.num_landmarks] = (torch.sigmoid(y[..., 5:5 + 2 * self.num_landmarks]) * 2 - 0.5 + self.grid[i].repeat(1, 1, 1, 1, int(2 * self.num_landmarks // 2))) * self.stride[i]
+-            # classes remain as logits/sigmoid depending on training setup
+-            y[..., 5 + 2 * self.num_landmarks:] = torch.sigmoid(y[..., 5 + 2 * self.num_landmarks:])
+-            z.append(y.view(bs, -1, self.no))
++            if self.onnx_dynamic or self.grid[i].shape[2:4] != x[i].shape[2:4]:
++                self.grid[i], self.anchor_grid[i] = self._make_grid(nx, ny, i)
++
++            # Apply sigmoid to all parts that should be in (0,1) and decode to absolute coordinates
++            y = x[i]
++            # Note: apply sigmoid selectively; xy,obj,cls and lmk use sigmoid for normalized outputs
++            y[..., 0:2] = (torch.sigmoid(y[..., 0:2]) * 2 - 0.5 + self.grid[i]) * self.stride[i]  # xy
++            y[..., 2:4] = (torch.sigmoid(y[..., 2:4]) * 2) ** 2 * self.anchor_grid[i]  # wh
++            y[..., 4:5] = torch.sigmoid(y[..., 4:5])  # objectness
++            # decode landmarks: use same scheme as xy (grid relative) then map to input scale via stride
++            if self.num_landmarks > 0:
++                # build repeated grid to match landmark channel layout: (1,1,ny,nx,2*num_landmarks)
++                if (2 * self.num_landmarks) > 2:
++                    grid_repeat = self.grid[i].repeat(1, 1, 1, 1, int(2 * self.num_landmarks // 2))
++                else:
++                    grid_repeat = self.grid[i]
++                y[..., 5:5 + 2 * self.num_landmarks] = (torch.sigmoid(y[..., 5:5 + 2 * self.num_landmarks]) * 2 - 0.5 + grid_repeat) * self.stride[i]
++            # classes remain as logits/sigmoid depending on training setup
++            y[..., 5 + (2 * self.num_landmarks if self.num_landmarks > 0 else 0):] = torch.sigmoid(y[..., 5 + (2 * self.num_landmarks if self.num_landmarks > 0 else 0):])
++            z.append(y.view(bs, -1, self.no))
+*** End Patch

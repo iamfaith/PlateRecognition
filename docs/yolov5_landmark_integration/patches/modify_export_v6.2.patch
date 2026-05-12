@@ -1,0 +1,10 @@
+*** Begin Patch
+*** Update File: export.py
+@@
+-    # Model outputs shape: (1, N, no) where no = 5 + nc
+-    # Verify output channels and adapt postprocessing scripts accordingly.
++    # Model outputs shape: (1, N, no) where no = 5 + 2*M + nc (landmarks included)
++    # If you added landmarks with num_landmarks=M, then no = 5 + 2*M + nc.
++    # Ensure inference postprocessing (infer.py) slices outputs accordingly:
++    # [x,y,w,h,obj, lmk0x,lmk0y,..., lmk(M-1)x,lmk(M-1)y, cls0, cls1, ...]
+*** End Patch

@@ -1,0 +1,58 @@
+*** Begin Patch
+*** Update File: utils/datasets.py
+@@
+-    def load_labels(self, path):
+-        labels = []
+-        with open(path, 'r') as f:
+-            for line in f.readlines():
+-                line = line.strip()
+-                if not line:
+-                    continue
+-                cls, x, y, w, h = line.split()[:5]
+-                labels.append([int(cls), float(x), float(y), float(w), float(h)])
+-        return labels
++    def load_labels(self, path):
++        """
++        Support two formats per line:
++          1) class x y w h
++          2) class x y w h lmk0_x lmk0_y ... lmk3_x lmk3_y  (total 1+4+8=13 values)
++        Landmarks are expected normalized to [0,1] relative to original image width/height.
++        Missing landmarks will be filled with -1 and a mask should be generated later.
++        """
++        labels = []
++        with open(path, 'r') as f:
++            for line in f.readlines():
++                vals = line.strip().split()
++                if not vals:
++                    continue
++                cls = int(vals[0])
++                if len(vals) < 5:
++                    continue
++                x = float(vals[1]); y = float(vals[2]); w = float(vals[3]); h = float(vals[4])
++                landms = []
++                if len(vals) >= 13:
++                    # parse 8 landmark values (4 points)
++                    for v in vals[5:13]:
++                        landms.append(float(v))
++                else:
++                    # pad with -1 indicating missing landmarks
++                    landms = [-1.0] * 8
++                labels.append([cls, x, y, w, h] + landms)
++        return labels
+@@
+-                # existing augmentation code should transform bbox; add same transforms for landmarks
+-                if len(lb) > 5:
+-                    lm = lb[5:]
+-                    # lm is list of 2*M normalized coords [x0,y0,x1,y1...]
+-                    # apply same image augmentation mapping used for bbox to lm pairs
+-                    # (implementation detail depends on augmentation functions used in this file)
++                # existing augmentation code should transform bbox; we must also transform landmarks.
++                # Implement a helper transform_points(points, M, Mmat) that applies the same affine matrix
++                # used for bbox/image transforms to each (x,y) pair (in pixel coordinates). For normalized
++                # coords convert to pixel coords first, apply transform, then convert back to normalized.
++                if len(lb) > 5:
++                    lm = lb[5:13]
++                    # convert normalized landmark -> pixel -> transform -> normalized
++                    # This requires image width/height and the current affine matrix used by augmentations.
++                    # Implementations vary; ensure the same transform is applied to both bbox and landmarks.
+*** End Patch

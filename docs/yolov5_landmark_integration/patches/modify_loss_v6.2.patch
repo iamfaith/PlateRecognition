@@ -1,0 +1,47 @@
+*** Begin Patch
+*** Update File: utils/loss.py
+@@
+-class ComputeLoss:
+-    def __init__(self, model, autobalance=False):
+-        super().__init__()
+-        device = next(model.parameters()).device
+-        h = model.hyp  # hyperparameters
+-        self.bce = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([h['cls_pw']], device=device))
+-        self.gr = 1.0
+-        # Loss gains
+-        self.hyp = h
+-        self.balance = {3: 4.0, 4: 1.0, 5: 0.4}
++class ComputeLoss:
++    def __init__(self, model, autobalance=False):
++        super().__init__()
++        device = next(model.parameters()).device
++        h = model.hyp  # hyperparameters
++        self.bce = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([h.get('cls_pw', 1.0)], device=device))
++        self.gr = 1.0
++        self.hyp = h
++        self.balance = {3: 4.0, 4: 1.0, 5: 0.4}
++        # landmark loss gain (configurable in hyp)
++        self.landmark_gain = h.get('landmark_loss_gain', 1.0)
+@@
+-        # box loss
++        # landmark loss: gather predicted and target landmarks for positive indices
++        # build_targets() MUST return t_lmk and t_lmk_mask aligned with indices
++        llmk = torch.zeros(1, device=device)
++        # p_lmk: predicted landmarks for positive samples (npos, 2*M)
++        # t_lmk: target landmarks for positive samples (npos, 2*M)
++        # t_lmk_mask: mask (npos, 2*M) where 1 indicates valid point, 0 indicates missing
++        if 't_lmk' in targets_dict:
++            p_lmk = targets_dict['p_lmk']
++            t_lmk = targets_dict['t_lmk']
++            t_lmk_mask = targets_dict.get('t_lmk_mask', None)
++            if p_lmk is not None and t_lmk is not None and p_lmk.numel() > 0:
++                if t_lmk_mask is not None:
++                    # apply mask so missing points don't contribute
++                    diff = (p_lmk - t_lmk) * t_lmk_mask
++                    llmk = F.smooth_l1_loss(diff, torch.zeros_like(diff), reduction='sum') / (t_lmk_mask.sum().clamp(min=1.0))
++                else:
++                    llmk = F.smooth_l1_loss(p_lmk, t_lmk, reduction='mean')
++                llmk = llmk * self.landmark_gain
++
++        # box loss
+*** End Patch
